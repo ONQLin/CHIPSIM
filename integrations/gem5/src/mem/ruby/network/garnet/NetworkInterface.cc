@@ -158,6 +158,8 @@ NetworkInterface::incrementStats(flit *t_flit)
 
     RouteInfo route = t_flit->get_route();
     Tick current_tick = curTick();
+    if (m_net_ptr->isHydraOnline())
+        m_net_ptr->receiveHydraFlit(route.phase_id);
 
 
     // Latency
@@ -176,7 +178,8 @@ NetworkInterface::incrementStats(flit *t_flit)
         
         // Track per-phase latency for all packets
         // For HEAD_TAIL (single flit) or TAIL with last_flit flag
-        if (t_flit->get_type() == HEAD_TAIL_ || route.last_flit) {
+        if (!m_net_ptr->isHydraOnline() &&
+            (t_flit->get_type() == HEAD_TAIL_ || route.last_flit)) {
             // Calculate actual latency (network_delay + queueing_delay)
             Tick total_latency = network_delay + queueing_delay;
             m_net_ptr->add_phase_latency(route.network_idx, route.input_idx, 
@@ -376,7 +379,8 @@ NetworkInterface::transferTraceRecordsToInjectionQueue()
     std::vector<NetDest> net_dests;
     std::vector<RouteInfo> routes;
     MsgPtr msg_ptr = nullptr;
-    OutputPort *oPort = getOutportForVnet(m_trace_record_queue.front().vnet);
+    // The queue may be empty after collecting this timestamp's records.
+    OutputPort *oPort = getOutportForVnet(same_time_records.front().vnet);
     assert(oPort);
 
 
@@ -441,7 +445,7 @@ NetworkInterface::transferTraceRecordsToInjectionQueue()
                 routes[r].last_flit = (i == same_time_records[r].num_flits - 1);
 
                 // Get a unique packet ID for each flit
-                int packet_id = m_net_ptr->getNextPacketID();
+                auto packet_id = m_net_ptr->getNextPacketID();
                 
                 // Create a single-flit packet (num_flits = 1)
                 // This ensures the flit type is HEAD_TAIL_
@@ -616,7 +620,7 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
 
         m_net_ptr->increment_injected_packets(vnet);
         m_net_ptr->update_traffic_distribution(route);
-        int packet_id = m_net_ptr->getNextPacketID();
+        auto packet_id = m_net_ptr->getNextPacketID();
         for (int i = 0; i < num_flits; i++) {
             m_net_ptr->increment_injected_flits(vnet);
             // flit *fl = new flit(packet_id,

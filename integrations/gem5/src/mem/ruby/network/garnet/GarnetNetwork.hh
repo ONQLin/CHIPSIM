@@ -34,6 +34,8 @@
 
 #include <iostream>
 #include <vector>
+#include <deque>
+#include <memory>
 
 #include "base/logging.hh"
 #include "mem/ruby/common/Consumer.hh"
@@ -105,6 +107,10 @@ class GarnetNetwork : public Network, public Consumer
     FaultModel* fault_model;
 
     bool isTraceEnabled() const { return m_trace_enable; }
+    bool isHydraOnline() const { return m_hydra_online; }
+    void submitHydraTransfer(int id, int source, int destination, int flits);
+    void receiveHydraFlit(int id);
+    std::vector<uint64_t> takeHydraCompletions();
     std::string getTraceFilename() const { return m_trace_filename; }
 
     void increment_trace_flits_received();
@@ -217,7 +223,7 @@ class GarnetNetwork : public Network, public Consumer
     }
 
     void update_traffic_distribution(RouteInfo route);
-    int getNextPacketID() { return m_next_packet_id++; }
+    uint64_t getNextPacketID() { return m_next_packet_id++; }
     bool end_simulation;
 
   protected:
@@ -231,6 +237,20 @@ class GarnetNetwork : public Network, public Consumer
     int m_routing_algorithm;
     bool m_enable_fault_model;
     bool m_trace_enable;
+    bool m_hydra_online;
+    std::map<int, uint64_t> m_hydra_remaining;
+    std::vector<uint64_t> m_hydra_completions;
+    struct HydraDmaFlow {
+        NetworkTraceRecord record;
+        Tick ready;
+    };
+    std::vector<std::deque<HydraDmaFlow>> m_hydra_dma_queues;
+    std::vector<std::unique_ptr<EventFunctionWrapper>> m_hydra_dma_events;
+    std::vector<double> m_hydra_hbm_bandwidths;
+    uint32_t m_hydra_dma_burst_bytes;
+    Tick m_hydra_hbm_access_ticks;
+    void scheduleHydraDma(int source);
+    void issueHydraDma(int source);
     std::string m_trace_filename;
     int m_trace_max_packets;
 
@@ -284,9 +304,9 @@ class GarnetNetwork : public Network, public Consumer
     // Trace File
     FILE * tracefile;
     NetworkTraceRecord trace_next_packet;
-    int trace_num_packets_injected; // number of packets injected so far
-    int trace_num_flits_injected;
-    int trace_num_flits_received; // number of trace flits received
+    uint64_t trace_num_packets_injected; // number of packets injected so far
+    uint64_t trace_num_flits_injected;
+    uint64_t trace_num_flits_received; // number of trace flits received
     int trace_start_time; // time-stamp of first packet in trace
 
   private:
@@ -299,7 +319,7 @@ class GarnetNetwork : public Network, public Consumer
     std::vector<NetworkBridge *> m_networkbridges; // All network bridges
     std::vector<CreditLink *> m_creditlinks; // All credit links in the network
     std::vector<NetworkInterface *> m_nis;   // All NI's in Network
-    int m_next_packet_id; // static vairable for packet id allocation
+    uint64_t m_next_packet_id;
 };
 
 inline std::ostream&

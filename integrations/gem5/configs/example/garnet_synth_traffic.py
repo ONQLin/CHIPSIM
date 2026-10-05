@@ -46,6 +46,10 @@ config_root = os.path.dirname(config_path)
 m5_root = os.path.dirname(config_root)
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--hydra-control-fd', type=int, default=None)
+parser.add_argument('--hydra-dma-burst-bytes', type=int, default=0)
+parser.add_argument('--hydra-hbm-bandwidths', default='[]')
+parser.add_argument('--hydra-hbm-access-ticks', type=int, default=0)
 Options.addNoISAOptions(parser)
 
 parser.add_argument(
@@ -210,10 +214,54 @@ root.system.mem_mode = "timing"
 # Not much point in this being higher than the L1 latency
 m5.ticks.setGlobalFrequency("1ps")
 
+if args.hydra_control_fd is not None:
+    import json
+    system.ruby.network.hydra_online = True
+    system.ruby.network.hydra_dma_burst_bytes = args.hydra_dma_burst_bytes
+    system.ruby.network.hydra_hbm_bandwidths = json.loads(args.hydra_hbm_bandwidths)
+    system.ruby.network.hydra_hbm_access_ticks = args.hydra_hbm_access_ticks
+
 # instantiate configuration
 m5.instantiate()
 
 # simulate until program terminates
-exit_event = m5.simulate(args.abs_max_tick)
+if args.hydra_control_fd is None:
+    exit_event = m5.simulate(args.abs_max_tick)
+    print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
+else:
+    import json
+    import socket
 
-print("Exiting @ tick", m5.curTick(), "because", exit_event.getCause())
+    class HydraNetworkController:
+        """Conservative online control without resetting the network state."""
+
+        def run(self, descriptor):
+            network = system.ruby.network
+            with socket.socket(fileno=descriptor) as connection:
+                with connection.makefile('rw') as stream:
+                    stream.write(json.dumps({'ready': True}) + '\n')
+                    stream.flush()
+                    for line in stream:
+                        request = json.loads(line)
+                        if request['kind'] == 'close':
+                            m5.stats.dump()
+                            break
+                        if request['kind'] == 'submit':
+                            network.submitHydraTransfer(request['flow_id'], request['source'],
+                                                        request['destination'], request['flits'])
+                        elif request['kind'] == 'advance':
+                            target = request['target_tick']
+                            if target < m5.curTick():
+                                raise ValueError('HYDRA attempted to reverse Garnet time.')
+                            if target > m5.curTick():
+                                event = m5.simulate(target - m5.curTick())
+                                if event.getCause() not in ('simulate() limit reached', 'HYDRA transfer completed'):
+                                    raise RuntimeError(event.getCause())
+                        else:
+                            raise ValueError('Unknown HYDRA control request.')
+                        result = {'tick': int(m5.curTick()),
+                                  'completed': list(network.takeHydraCompletions())}
+                        stream.write(json.dumps(result) + '\n')
+                        stream.flush()
+
+    HydraNetworkController().run(args.hydra_control_fd)

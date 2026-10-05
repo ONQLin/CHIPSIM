@@ -43,7 +43,7 @@ namespace garnet
 {
 
 // Constructor for the flit
-flit::flit(int packet_id, int id, int  vc, int vnet, RouteInfo route, int size,
+flit::flit(uint64_t packet_id, int id, int  vc, int vnet, RouteInfo route, int size,
     MsgPtr msg_ptr, int MsgSize, uint32_t bWidth, Tick curTime)
 {
     m_size = size;

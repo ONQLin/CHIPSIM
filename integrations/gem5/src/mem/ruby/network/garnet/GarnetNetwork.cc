@@ -33,6 +33,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <cmath>
 #include <stdio.h>
 #include <unistd.h>
 #include <map>
@@ -86,6 +87,11 @@ GarnetNetwork::GarnetNetwork(const Params &p)
     m_trace_enable = p.trace_enable;
     m_trace_filename = p.trace_file;
     m_trace_max_packets = p.trace_max_packets;
+    m_hydra_online = p.hydra_online;
+    m_hydra_dma_burst_bytes = p.hydra_dma_burst_bytes;
+    m_hydra_hbm_bandwidths = p.hydra_hbm_bandwidths;
+    m_hydra_hbm_access_ticks = p.hydra_hbm_access_ticks;
+    end_simulation = false;
 
     m_vnet_type.resize(m_virtual_networks);
 
@@ -96,6 +102,7 @@ GarnetNetwork::GarnetNetwork(const Params &p)
             m_vnet_type[i] = CTRL_VNET_; // carries only ctrl packets
     }
 
+    if (!m_hydra_online) {
     const char *trace_filename; //[100];
     trace_filename = m_trace_filename.c_str();
     //strcpy(trace_filename, m_trace_filename);
@@ -151,6 +158,7 @@ GarnetNetwork::GarnetNetwork(const Params &p)
         }
     }
 */
+    }
     trace_num_packets_injected = 0;
     trace_num_flits_injected = 0;
     trace_num_flits_received = 0;
@@ -200,7 +208,8 @@ GarnetNetwork::GarnetNetwork(const Params &p)
     }
     */
 
-    scheduleWakeupAbsolute(curCycle() + Cycles(1));
+    if (!m_hydra_online)
+        scheduleWakeupAbsolute(curCycle() + Cycles(1));
 
     // record the routers
     for (std::vector<BasicRouter*>::const_iterator i =  p.routers.begin();
@@ -220,8 +229,116 @@ GarnetNetwork::GarnetNetwork(const Params &p)
         ni->init_net_ptr(this);
     }
 
+    if (m_hydra_dma_burst_bytes) {
+        fatal_if(!m_hydra_online || m_hydra_hbm_bandwidths.size() != m_routers.size(),
+                 "DMA pacing requires per-router HBM bandwidths and online mode");
+        fatal_if(m_hydra_dma_burst_bytes < m_ni_flit_size,
+                 "DMA burst must hold at least one network flit");
+        m_hydra_dma_queues.resize(m_routers.size());
+        for (int source = 0; source < m_routers.size(); ++source) {
+            m_hydra_dma_events.emplace_back(new EventFunctionWrapper(
+                [this, source] { issueHydraDma(source); }, name() + ".hydra_dma"));
+        }
+    }
+
     // Print Garnet version
     inform("Garnet version %s\n", garnetVersion);
+}
+
+void
+GarnetNetwork::submitHydraTransfer(int id, int source, int destination, int flits)
+{
+    fatal_if(!m_hydra_online || id < 0 || flits <= 0,
+             "Invalid online HYDRA transfer");
+    const int routers = m_routers.size();
+    fatal_if(source < 0 || source >= routers || destination < 0 ||
+             destination >= routers || m_hydra_remaining.count(id),
+             "Invalid HYDRA endpoints or duplicate active transfer ID");
+    NetworkTraceRecord record{};
+    record.valid = true;
+    record.time = curCycle();
+    record.src_id = source;
+    record.src_router_id = source;
+    record.dest_id = destination + routers;
+    record.dest_router_id = destination;
+    record.vnet = 0;
+    record.num_flits = flits;
+    record.network_idx = 0;
+    record.input_idx = 0;
+    record.phase_id = id;
+    m_hydra_remaining[id] = flits;
+    if (m_hydra_dma_burst_bytes) {
+        fatal_if(m_hydra_hbm_bandwidths[source] <= 0,
+                 "DMA source has no physical HBM bandwidth");
+        m_hydra_dma_queues[source].push_back({record, curTick() + m_hydra_hbm_access_ticks});
+        scheduleHydraDma(source);
+    } else {
+        m_nis[source]->enqueueTracePacket(record);
+    }
+}
+
+void
+GarnetNetwork::scheduleHydraDma(int source)
+{
+    auto &queue = m_hydra_dma_queues[source];
+    auto &event = *m_hydra_dma_events[source];
+    if (queue.empty() || event.scheduled())
+        return;
+    // Round-robin eligible flows; do not idle behind a not-yet-ready flow.
+    auto next = std::find_if(queue.begin(), queue.end(),
+                            [](const HydraDmaFlow &flow) { return flow.ready <= curTick(); });
+    if (next == queue.end()) {
+        next = std::min_element(queue.begin(), queue.end(),
+             [](const HydraDmaFlow &a, const HydraDmaFlow &b) { return a.ready < b.ready; });
+    }
+    std::rotate(queue.begin(), next, queue.end());
+    const int flits = std::min(queue.front().record.num_flits,
+                              int(m_hydra_dma_burst_bytes / m_ni_flit_size));
+    const Tick service = std::max<Tick>(1, std::ceil(
+        double(flits) * m_ni_flit_size * 1e12 / m_hydra_hbm_bandwidths[source]));
+    schedule(event, std::max(curTick(), queue.front().ready) + service);
+}
+
+void
+GarnetNetwork::issueHydraDma(int source)
+{
+    auto &queue = m_hydra_dma_queues[source];
+    auto flow = queue.front();
+    queue.pop_front();
+    auto burst = flow.record;
+    burst.time = curCycle();
+    burst.num_flits = std::min(flow.record.num_flits,
+                              int(m_hydra_dma_burst_bytes / m_ni_flit_size));
+    m_nis[source]->enqueueTracePacket(burst);
+    flow.record.num_flits -= burst.num_flits;
+    if (flow.record.num_flits)
+        queue.push_back(flow);
+    scheduleHydraDma(source);
+}
+
+void
+GarnetNetwork::receiveHydraFlit(int id)
+{
+    auto entry = m_hydra_remaining.find(id);
+    fatal_if(entry == m_hydra_remaining.end() || entry->second == 0,
+             "Unexpected HYDRA flit completion");
+    if (--entry->second == 0) {
+        const bool first_completion = m_hydra_completions.empty();
+        m_hydra_completions.push_back(id);
+        m_hydra_completions.push_back(curTick());
+        m_hydra_remaining.erase(entry);
+        // Stop at the completion, preserving all other packets and credits.
+        if (first_completion)
+            exitSimLoop("HYDRA transfer completed");
+    }
+}
+
+std::vector<uint64_t>
+GarnetNetwork::takeHydraCompletions()
+{
+    std::vector<uint64_t> result;
+    result.swap(m_hydra_completions);
+    return result;
 }
 
 bool 
@@ -380,6 +497,8 @@ void
 GarnetNetwork::increment_trace_flits_received()
 {
     trace_num_flits_received++;
+    if (m_hydra_online)
+        return;
 
     DPRINTF(NetworkTrace, "Num flits injected = %d, Num flits received = %d\n",
         trace_num_flits_injected, trace_num_flits_received);
@@ -747,25 +866,29 @@ GarnetNetwork::regStats()
     m_packet_max_latency
         .name(name() + ".main_layer_latency");
 
-    // Pre-register layer latency stats for all possible combinations
-    // These limits should cover most use cases while keeping memory reasonable
-    // If you need more, increase these constants
-    const int MAX_NETWORKS = 20;  // Maximum number of networks to track
-    const int MAX_INPUTS = 20;    // Maximum number of inputs per network
-    const int MAX_PHASES = 500;   // Maximum number of phases per network
-    
-    for (int net = 0; net < MAX_NETWORKS; net++) {
-        for (int inp = 0; inp < MAX_INPUTS; inp++) {
-            for (int phase = 0; phase < MAX_PHASES; phase++) {
-                auto key = std::make_tuple(net, inp, phase);
-                std::string stat_name = name() + ".phase_latency_" + 
-                                        std::to_string(net) + "_" +
-                                        std::to_string(inp) + "_" +
-                                        std::to_string(phase);
-                
-                m_phase_latency_stats[key] = new statistics::Scalar();
-                m_phase_latency_stats[key]->name(stat_name);
-                m_phase_latency_stats[key]->flags(statistics::nozero);
+    // Register only phases present in a finite trace. Live traces retain the
+    // legacy bounds because future phase IDs are not known at initialization.
+    const auto register_phase = [this](int net, int inp, int phase) {
+        auto key = std::make_tuple(net, inp, phase);
+        auto *stat = new statistics::Scalar();
+        stat->name(name() + ".phase_latency_" + std::to_string(net) + "_" +
+                   std::to_string(inp) + "_" + std::to_string(phase));
+        stat->flags(statistics::nozero);
+        m_phase_latency_stats[key] = stat;
+    };
+    const auto &phase_ids = static_cast<const Params &>(params()).trace_phase_ids;
+    fatal_if(phase_ids.size() % 3 != 0,
+             "Trace phase IDs must contain network/input/phase triples");
+    if (!phase_ids.empty()) {
+        for (size_t i = 0; i < phase_ids.size(); i += 3) {
+            register_phase(phase_ids[i], phase_ids[i + 1], phase_ids[i + 2]);
+        }
+    } else if (!m_hydra_online) {
+        for (int net = 0; net < 20; ++net) {
+            for (int inp = 0; inp < 20; ++inp) {
+                for (int phase = 0; phase < 500; ++phase) {
+                    register_phase(net, inp, phase);
+                }
             }
         }
     }

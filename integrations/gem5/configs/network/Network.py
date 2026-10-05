@@ -190,6 +190,24 @@ def init_network(options, network, InterfaceClass):
         network.trace_enable  = options.network_trace_enable
         network.trace_file = options.network_trace_file
         network.trace_max_packets = options.network_trace_max_packets
+        # Finite compressed traces allow exact, sparse statistic registration.
+        # Keep legacy registration for live (tail -f) traces.
+        if options.network_trace_enable and options.network_trace_file.endswith(".gz"):
+            import gzip
+            phase_ids = set()
+            with gzip.open(options.network_trace_file, "rt") as stream:
+                for line in stream:
+                    fields = line.split()
+                    if not fields or fields[0].startswith("#"):
+                        continue
+                    if len(fields) < 7:
+                        raise ValueError("Expected at least seven fields in a Garnet trace.")
+                    phase = tuple(int(fields[i]) if i < len(fields) else 0
+                                  for i in range(7, 10))
+                    if min(phase) < 0:
+                        raise ValueError("Garnet trace phase IDs must be nonnegative.")
+                    phase_ids.add(phase)
+            network.trace_phase_ids = [value for phase in sorted(phase_ids) for value in phase]
 
         print(network.trace_file)
 

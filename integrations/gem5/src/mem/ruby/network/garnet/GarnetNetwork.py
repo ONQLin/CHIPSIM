@@ -34,6 +34,7 @@ from m5.objects.ClockedObject import ClockedObject
 from m5.objects.Network import RubyNetwork
 from m5.params import *
 from m5.proxy import *
+from m5.SimObject import PyBindMethod
 
 
 class GarnetNetwork(RubyNetwork):
@@ -52,6 +53,12 @@ class GarnetNetwork(RubyNetwork):
     trace_enable = Param.Bool(False, "enable trace simulation");
     trace_file  = Param.String(" ", "network trace input file");
     trace_max_packets = Param.Int(-1, "maximum trace packets to inject");
+    trace_phase_ids = VectorParam.Int([], "Flattened network/input/phase triples in a finite trace")
+    hydra_online = Param.Bool(False, "Accept online HYDRA transfers and return completions")
+    hydra_dma_burst_bytes = Param.UInt32(0, "HBM DMA burst bytes; zero disables pacing")
+    hydra_hbm_bandwidths = VectorParam.Float([], "HBM source bandwidth in bytes/second by router ID")
+    hydra_hbm_access_ticks = Param.Tick(0, "HBM access delay before a transfer becomes eligible")
+    cxx_exports = [PyBindMethod("submitHydraTransfer"), PyBindMethod("takeHydraCompletions")]
     garnet_deadlock_threshold = Param.UInt32(
         50000, "network-level deadlock threshold"
     )
